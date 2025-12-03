@@ -1,0 +1,7 @@
+{
+  "name": "The Digital Charioteer",
+  "description": "An immersive, conversational AI experience embodying Lord Krishna to provide spiritual guidance based on the Bhagavad Gita.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
