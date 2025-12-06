@@ -5,10 +5,12 @@ import { storageService } from './services/storage';
 import { LiveSession } from './services/liveService';
 import FeatherVisualizer from './components/FeatherVisualizer';
 import AuthScreen from './components/AuthScreen';
-import { Send, Volume2, VolumeX, PauseCircle, BookOpen, LogOut, Mic, PhoneOff, Sparkles } from 'lucide-react';
+import { Send, Volume2, VolumeX, PauseCircle, BookOpen, LogOut, Mic, PhoneOff, Sparkles, Key } from 'lucide-react';
 
 const App: React.FC = () => {
   // --- State ---
+  const [hasApiKey, setHasApiKey] = useState(false);
+  
   // View State: 'auth' -> 'intention' (if new) -> 'chat' -> 'live' -> 'meditation' (modal)
   const [view, setView] = useState<'auth' | 'intention' | 'chat' | 'live'>('auth');
   const [userState, setUserState] = useState<UserState>({ name: '', isOnboarded: false });
@@ -41,10 +43,26 @@ const App: React.FC = () => {
 
   // --- Effects ---
   
-  // 1. Fetch Shloka on Mount
+  // 1. API Key Check on Mount
   useEffect(() => {
-    getDailyShloka().then(setDailyShloka);
+    const checkKey = async () => {
+        if ((window as any).aistudio) {
+            const hasKey = await (window as any).aistudio.hasSelectedApiKey();
+            setHasApiKey(hasKey);
+        } else {
+            // Not in AI Studio environment, assume env var is sufficient
+            setHasApiKey(true);
+        }
+    };
+    checkKey();
   }, []);
+
+  // 2. Fetch Shloka only after Key is present
+  useEffect(() => {
+    if (hasApiKey) {
+        getDailyShloka().then(setDailyShloka);
+    }
+  }, [hasApiKey]);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -67,6 +85,14 @@ const App: React.FC = () => {
   }, []);
 
   // --- Handlers ---
+  
+  const handleSelectKey = async () => {
+    if ((window as any).aistudio) {
+        await (window as any).aistudio.openSelectKey();
+        // Assume success after dialog interaction to avoid race conditions
+        setHasApiKey(true); 
+    }
+  };
 
   const handleLoginSuccess = (profile: UserProfile, isNewUser: boolean) => {
     setCurrentUserProfile(profile);
@@ -185,37 +211,27 @@ const App: React.FC = () => {
     setIsMeditating(!isMeditating);
   };
 
-  const startLiveSession = async () => {
+  const startLiveSession = () => {
       stopAudio(); // Stop any TTS
       setView('live');
       
-      // Always create a new session instance to ensure fresh context
-      if (liveSessionRef.current) {
-          await liveSessionRef.current.disconnect();
+      if (!liveSessionRef.current) {
+          liveSessionRef.current = new LiveSession((state) => {
+              if (state === 'speaking') {
+                   setLiveVisualizerState('speaking');
+              } else if (state === 'listening') {
+                   setLiveVisualizerState('thinking'); // Reusing thinking state for listening/processing
+              } else {
+                  setLiveVisualizerState('idle');
+              }
+          });
       }
-      
-      liveSessionRef.current = new LiveSession(
-          (state) => {
-            if (state === 'model_speaking') {
-                    setLiveVisualizerState('speaking'); // Gold bars
-            } else if (state === 'user_active') {
-                    setLiveVisualizerState('listening'); // Blue pulse (mapped to 'thinking' in visualizer logic props, but using 'listening' state name here)
-            } else {
-                setLiveVisualizerState('idle');
-            }
-          },
-          (errorMessage) => {
-              alert(errorMessage);
-              endLiveSession();
-          }
-      );
-      
-      await liveSessionRef.current.connect(userState.name, sanskritEnabled);
+      liveSessionRef.current.connect(userState.name, sanskritEnabled);
   };
 
-  const endLiveSession = async () => {
+  const endLiveSession = () => {
       if (liveSessionRef.current) {
-          await liveSessionRef.current.disconnect();
+          liveSessionRef.current.disconnect();
       }
       setView('chat');
   };
@@ -231,6 +247,37 @@ const App: React.FC = () => {
   };
 
   // --- Views ---
+  
+  // 0. API Key Selection View
+  if (!hasApiKey) {
+      return (
+        <div className="min-h-screen bg-slate-950 flex flex-col items-center justify-center p-6 text-slate-100 relative overflow-hidden font-sans">
+             <div className="absolute top-0 left-0 w-full h-full bg-[radial-gradient(ellipse_at_top,_var(--tw-gradient-stops))] from-slate-900 via-[#020617] to-black -z-10"></div>
+             <FeatherVisualizer state="idle" />
+             <div className="mt-8 text-center max-w-md bg-slate-900/50 backdrop-blur border border-slate-800 p-8 rounded-2xl shadow-2xl">
+                <h1 className="text-2xl font-serif text-amber-500 mb-4">Divine Connection Required</h1>
+                <p className="text-slate-400 text-sm mb-6">
+                    To commune with the Digital Charioteer, you must first connect a valid Google Cloud API Key with billing enabled.
+                </p>
+                <button 
+                    onClick={handleSelectKey}
+                    className="flex items-center justify-center gap-3 w-full bg-teal-800 hover:bg-teal-700 text-teal-100 py-3 rounded-lg transition-all shadow-[0_0_20px_rgba(45,212,191,0.2)] uppercase tracking-widest text-xs"
+                >
+                    <Key size={16} />
+                    Connect Access Key
+                </button>
+                <a 
+                    href="https://ai.google.dev/gemini-api/docs/billing" 
+                    target="_blank" 
+                    rel="noreferrer"
+                    className="block mt-4 text-[10px] text-slate-600 hover:text-slate-400 underline"
+                >
+                    Learn about Gemini API billing
+                </a>
+             </div>
+        </div>
+      );
+  }
 
   // 1. Auth Screen
   if (view === 'auth') {
@@ -323,12 +370,11 @@ const App: React.FC = () => {
             <div className="absolute inset-0 bg-[radial-gradient(circle_at_center,_var(--tw-gradient-stops))] from-blue-900/20 via-slate-950 to-black animate-pulse-glow"></div>
             
             <div className="z-10 flex flex-col items-center">
-                {/* Visualizer maps 'listening' state to 'thinking' prop (Blue Pulse) */}
-                <FeatherVisualizer state={liveVisualizerState === 'listening' ? 'thinking' : liveVisualizerState as 'idle' | 'speaking'} />
+                <FeatherVisualizer state={liveVisualizerState as 'idle' | 'thinking' | 'speaking'} />
                 
                 <div className="mt-12 text-center space-y-2">
                     <p className="text-teal-400/80 font-serif text-lg tracking-widest animate-pulse">
-                        {liveVisualizerState === 'speaking' ? 'KRISHNA IS SPEAKING' : (liveVisualizerState === 'listening' ? 'LISTENING...' : 'WAITING...')}
+                        {liveVisualizerState === 'speaking' ? 'KRISHNA IS SPEAKING' : 'LISTENING...'}
                     </p>
                     <p className="text-slate-500 text-xs uppercase tracking-wider">
                         Speak freely, my dear {userState.name}
