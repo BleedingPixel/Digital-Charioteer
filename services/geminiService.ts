@@ -4,7 +4,7 @@ import { Message } from '../types';
 const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
 
 // System instructions for the persona
-const getSystemInstruction = (userName: string, sanskritEnabled: boolean) => `
+export const getSystemInstruction = (userName: string, sanskritEnabled: boolean) => `
 You are Lord Krishna, the Supreme Personality of Godhead, acting as a "Sakha" (best friend) and spiritual guide to "${userName}".
 
 **Interaction Protocol:**

@@ -1,18 +1,32 @@
-import React, { useState, useRef, useEffect, useCallback } from 'react';
-import { Message, UserState, Mood } from './types';
+import React, { useState, useRef, useEffect } from 'react';
+import { Message, UserState, UserProfile } from './types';
 import { generateKrishnaResponse, generateSpeech, getDailyShloka } from './services/geminiService';
+import { storageService } from './services/storage';
+import { LiveSession } from './services/liveService';
 import FeatherVisualizer from './components/FeatherVisualizer';
-import { Mic, Send, Volume2, VolumeX, PauseCircle, BookOpen, Sun, ChevronRight, RefreshCcw } from 'lucide-react';
+import AuthScreen from './components/AuthScreen';
+import { Send, Volume2, VolumeX, PauseCircle, BookOpen, LogOut, Mic, PhoneOff, Sparkles } from 'lucide-react';
 
 const App: React.FC = () => {
   // --- State ---
+  // View State: 'auth' -> 'intention' (if new) -> 'chat' -> 'live' -> 'meditation' (modal)
+  const [view, setView] = useState<'auth' | 'intention' | 'chat' | 'live'>('auth');
   const [userState, setUserState] = useState<UserState>({ name: '', isOnboarded: false });
+  const [currentUserProfile, setCurrentUserProfile] = useState<UserProfile | null>(null);
+  
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [isMeditating, setIsMeditating] = useState(false);
   
+  // Live Voice State
+  const [liveVisualizerState, setLiveVisualizerState] = useState<'idle' | 'listening' | 'speaking'>('idle');
+  const liveSessionRef = useRef<LiveSession | null>(null);
+
+  // Intention Step State
+  const [onboardingIntention, setOnboardingIntention] = useState('');
+
   // Settings
   const [voiceEnabled, setVoiceEnabled] = useState(false);
   const [sanskritEnabled, setSanskritEnabled] = useState(false);
@@ -26,40 +40,69 @@ const App: React.FC = () => {
   const [dailyShloka, setDailyShloka] = useState<string>('');
 
   // --- Effects ---
-
-  // Scroll to bottom on new message
-  useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages]);
-
-  // Load daily shloka on mount
   useEffect(() => {
     getDailyShloka().then(setDailyShloka);
   }, []);
 
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [messages, view]);
+
+  // Save history whenever messages change, if user is logged in
+  useEffect(() => {
+    if (currentUserProfile && messages.length > 0) {
+      storageService.saveHistory(currentUserProfile.username, messages);
+    }
+  }, [messages, currentUserProfile]);
+
+  // Cleanup Live Session on unmount
+  useEffect(() => {
+      return () => {
+          if (liveSessionRef.current) {
+              liveSessionRef.current.disconnect();
+          }
+      };
+  }, []);
+
   // --- Handlers ---
 
-  const handleOnboarding = (name: string, mood?: Mood) => {
-    const trimmedName = name.trim();
-    if (!trimmedName) return;
-
-    setUserState({ name: trimmedName, isOnboarded: true });
-
-    let initialPrompt = `My name is ${trimmedName}.`;
-    if (mood) {
-      initialPrompt += ` I am feeling ${mood} right now.`;
+  const handleLoginSuccess = (profile: UserProfile, isNewUser: boolean) => {
+    setCurrentUserProfile(profile);
+    setUserState({ name: profile.name, username: profile.username, isOnboarded: !isNewUser });
+    
+    if (isNewUser) {
+      // Go to Intention setting
+      setView('intention');
+      setMessages([]); // Clear any previous state
     } else {
-      initialPrompt += ` I seek your guidance.`;
+      // Load history
+      const history = storageService.getHistory(profile.username);
+      setMessages(history);
+      setView('chat');
     }
+  };
 
-    // Trigger initial conversation
-    handleSendMessage(initialPrompt, true);
+  const handleLogout = () => {
+    if (liveSessionRef.current) {
+        liveSessionRef.current.disconnect();
+        liveSessionRef.current = null;
+    }
+    setCurrentUserProfile(null);
+    setUserState({ name: '', isOnboarded: false });
+    setMessages([]);
+    setView('auth');
+    stopAudio();
+  };
+
+  const submitIntention = (moodText?: string) => {
+    const intention = moodText || onboardingIntention || "I seek your guidance.";
+    setView('chat');
+    handleSendMessage(intention);
   };
 
   const playAudio = async (text: string) => {
     if (!voiceEnabled) return;
     
-    // Stop current audio if playing
     if (audioSourceRef.current) {
         audioSourceRef.current.stop();
     }
@@ -72,7 +115,6 @@ const App: React.FC = () => {
             audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
         }
         
-        // Resume context if suspended (browser policy)
         if (audioContextRef.current.state === 'suspended') {
             await audioContextRef.current.resume();
         }
@@ -92,9 +134,10 @@ const App: React.FC = () => {
     }
   };
 
-  const handleSendMessage = async (text: string, isInitial = false) => {
-    if (!text.trim() && !isInitial) return;
+  const handleSendMessage = async (text: string) => {
+    if (!text.trim()) return;
 
+    // Add User Message
     const newMessage: Message = {
       id: Date.now().toString(),
       role: 'user',
@@ -102,14 +145,14 @@ const App: React.FC = () => {
       timestamp: Date.now(),
     };
 
-    // Optimistic update
-    setMessages(prev => [...prev, newMessage]);
+    const newMessages = [...messages, newMessage];
+    setMessages(newMessages);
     setInput('');
     setIsLoading(true);
 
     // Call API
     const responseText = await generateKrishnaResponse(
-      messages, 
+      newMessages, 
       text, 
       userState.name, 
       sanskritEnabled
@@ -125,7 +168,6 @@ const App: React.FC = () => {
     setMessages(prev => [...prev, botMessage]);
     setIsLoading(false);
 
-    // Trigger Speech
     playAudio(responseText);
   };
 
@@ -141,9 +183,31 @@ const App: React.FC = () => {
     setIsMeditating(!isMeditating);
   };
 
-  // --- Render Helpers ---
+  const startLiveSession = () => {
+      stopAudio(); // Stop any TTS
+      setView('live');
+      
+      if (!liveSessionRef.current) {
+          liveSessionRef.current = new LiveSession((state) => {
+              if (state === 'speaking') {
+                   setLiveVisualizerState('speaking');
+              } else if (state === 'listening') {
+                   setLiveVisualizerState('thinking'); // Reusing thinking state for listening/processing
+              } else {
+                  setLiveVisualizerState('idle');
+              }
+          });
+      }
+      liveSessionRef.current.connect(userState.name, sanskritEnabled);
+  };
 
-  // Markdown-like parser for simple bold/italic
+  const endLiveSession = () => {
+      if (liveSessionRef.current) {
+          liveSessionRef.current.disconnect();
+      }
+      setView('chat');
+  };
+
   const renderText = (text: string) => {
     return text.split('\n').map((line, i) => (
       <p key={i} className="mb-2 leading-relaxed opacity-90">
@@ -156,74 +220,73 @@ const App: React.FC = () => {
 
   // --- Views ---
 
-  if (!userState.isOnboarded) {
+  // 1. Auth Screen
+  if (view === 'auth') {
+    return <AuthScreen onLogin={handleLoginSuccess} dailyShloka={dailyShloka} />;
+  }
+
+  // 2. Intention Screen (New Users Only)
+  if (view === 'intention') {
     return (
-      <div className="min-h-screen bg-slate-950 flex flex-col items-center justify-center p-6 text-slate-100 relative overflow-hidden">
-        {/* Background Gradients */}
-        <div className="absolute top-0 left-0 w-full h-full bg-[radial-gradient(ellipse_at_top,_var(--tw-gradient-stops))] from-slate-900 via-[#020617] to-black -z-10"></div>
-        <div className="absolute top-10 left-1/2 -translate-x-1/2 w-[500px] h-[500px] bg-teal-900/20 rounded-full blur-[100px] pointer-events-none"></div>
+        <div className="min-h-screen bg-slate-950 flex flex-col items-center justify-center p-6 text-slate-100 relative overflow-hidden font-sans">
+             <div className="absolute top-0 left-0 w-full h-full bg-[radial-gradient(ellipse_at_top,_var(--tw-gradient-stops))] from-slate-900 via-[#020617] to-black -z-10"></div>
+             
+             {/* Logout Option for Intention Screen */}
+             <div className="absolute top-4 right-4 z-50">
+                <button 
+                  onClick={handleLogout}
+                  className="p-2 text-slate-500 hover:text-red-400 transition-colors bg-slate-900/50 rounded-full"
+                  title="Logout"
+                >
+                  <LogOut size={20} />
+                </button>
+             </div>
 
-        <div className="max-w-md w-full animate-fade-in flex flex-col items-center z-10">
-          <FeatherVisualizer state="idle" />
-          
-          <h1 className="text-4xl md:text-5xl text-amber-500 mb-2 mt-8 text-center drop-shadow-lg">The Digital Charioteer</h1>
-          <p className="text-teal-200/80 text-center mb-8 font-light italic">"I am seated in everyone's heart, and from Me come remembrance, knowledge and forgetfulness."</p>
+             <div className="max-w-md w-full animate-fade-in flex flex-col items-center z-10">
+                <FeatherVisualizer state="idle" />
+                
+                <div className="w-full bg-slate-900/50 backdrop-blur-md border border-slate-800 rounded-2xl p-8 shadow-2xl mt-8">
+                    <div className="text-center space-y-1 mb-6">
+                        <h2 className="text-lg text-teal-100 font-light">My dear {userState.name},</h2>
+                        <p className="text-slate-500 text-xs uppercase tracking-wide">What burdens your heart today?</p>
+                    </div>
 
-          <div className="w-full bg-slate-900/50 backdrop-blur-md border border-slate-800 rounded-2xl p-6 shadow-2xl">
-            <label className="block text-sm text-slate-400 mb-2 uppercase tracking-wider">What may I call you?</label>
-            <div className="flex gap-2">
-              <input 
-                type="text" 
-                value={input}
-                onChange={(e) => setInput(e.target.value)}
-                onKeyDown={(e) => e.key === 'Enter' && handleOnboarding(input)}
-                placeholder="Enter your name..."
-                className="flex-1 bg-slate-950 border border-slate-700 rounded-lg px-4 py-3 focus:outline-none focus:border-amber-500 text-amber-50 placeholder-slate-600 transition-colors"
-              />
-              <button 
-                onClick={() => handleOnboarding(input)}
-                className="bg-amber-600 hover:bg-amber-500 text-white px-4 rounded-lg transition-colors flex items-center justify-center"
-              >
-                <ChevronRight size={24} />
-              </button>
-            </div>
+                    <textarea 
+                        value={onboardingIntention}
+                        onChange={(e) => setOnboardingIntention(e.target.value)}
+                        placeholder="I feel..."
+                        className="w-full h-24 bg-slate-950/50 border border-slate-700 rounded-lg p-3 text-sm focus:outline-none focus:border-amber-500 text-slate-200 resize-none placeholder-slate-600 mb-4"
+                        autoFocus
+                    />
 
-            <div className="mt-8">
-              <p className="text-center text-slate-500 text-xs mb-4 uppercase tracking-widest">Or begin with your heart's burden</p>
-              <div className="grid grid-cols-2 gap-3">
-                {(['Confused', 'Anxious', 'Sad', 'Grateful'] as Mood[]).map((mood) => (
-                  <button 
-                    key={mood}
-                    onClick={() => {
-                        if (!input.trim()) {
-                            alert("Please enter your name first, so I may address you properly.");
-                            return;
-                        }
-                        handleOnboarding(input, mood);
-                    }}
-                    className="p-3 border border-slate-700 hover:border-teal-500/50 hover:bg-teal-950/30 rounded-lg text-sm text-slate-300 transition-all duration-300"
-                  >
-                    {mood}
-                  </button>
-                ))}
-              </div>
-            </div>
-          </div>
-          
-          {dailyShloka && (
-            <div className="mt-12 text-center max-w-sm">
-                <span className="text-amber-500/60 text-xs uppercase tracking-widest block mb-2">Shloka of the Day</span>
-                <p className="text-slate-400 text-sm italic font-serif leading-relaxed">"{dailyShloka}"</p>
-            </div>
-          )}
+                    <div className="grid grid-cols-2 gap-2 mb-4">
+                         {(['Confused', 'Anxious', 'Sad', 'Grateful'] as const).map((mood) => (
+                             <button
+                                key={mood}
+                                onClick={() => submitIntention(`I am feeling ${mood}`)}
+                                className="p-2 border border-slate-700/50 rounded hover:bg-teal-900/20 hover:border-teal-500/30 text-xs text-slate-400 transition-colors"
+                             >
+                                {mood}
+                             </button>
+                         ))}
+                    </div>
+
+                    <button 
+                        onClick={() => submitIntention()}
+                        className="w-full bg-gradient-to-r from-teal-900 to-slate-900 border border-teal-500/30 text-teal-100 py-3 rounded-lg hover:shadow-[0_0_15px_rgba(45,212,191,0.2)] transition-all uppercase tracking-widest text-xs"
+                    >
+                        Begin Journey
+                    </button>
+                </div>
+             </div>
         </div>
-      </div>
     );
   }
 
+  // 3. Meditation Overlay
   if (isMeditating) {
     return (
-        <div className="min-h-screen bg-black flex flex-col items-center justify-center relative transition-opacity duration-1000">
+        <div className="fixed inset-0 bg-black flex flex-col items-center justify-center relative transition-opacity duration-1000 z-50">
             <div className="absolute inset-0 bg-[radial-gradient(circle_at_center,_var(--tw-gradient-stops))] from-teal-900/20 via-black to-black"></div>
             
             <FeatherVisualizer state="thinking" />
@@ -240,29 +303,70 @@ const App: React.FC = () => {
     )
   }
 
+  // 4. Voice Mode View
+  if (view === 'live') {
+      return (
+        <div className="min-h-screen bg-slate-950 flex flex-col items-center justify-center relative overflow-hidden z-40">
+            {/* Ambient Background */}
+            <div className="absolute inset-0 bg-[radial-gradient(circle_at_center,_var(--tw-gradient-stops))] from-blue-900/20 via-slate-950 to-black animate-pulse-glow"></div>
+            
+            <div className="z-10 flex flex-col items-center">
+                <FeatherVisualizer state={liveVisualizerState as 'idle' | 'thinking' | 'speaking'} />
+                
+                <div className="mt-12 text-center space-y-2">
+                    <p className="text-teal-400/80 font-serif text-lg tracking-widest animate-pulse">
+                        {liveVisualizerState === 'speaking' ? 'KRISHNA IS SPEAKING' : 'LISTENING...'}
+                    </p>
+                    <p className="text-slate-500 text-xs uppercase tracking-wider">
+                        Speak freely, my dear {userState.name}
+                    </p>
+                </div>
+
+                <button 
+                    onClick={endLiveSession}
+                    className="mt-16 w-16 h-16 rounded-full bg-red-500/10 border border-red-500/30 text-red-500 flex items-center justify-center hover:bg-red-500 hover:text-white transition-all duration-300 shadow-[0_0_20px_rgba(239,68,68,0.2)]"
+                >
+                    <PhoneOff size={24} />
+                </button>
+            </div>
+        </div>
+      );
+  }
+
+  // 5. Main Chat View
+  // Using 100dvh (Dynamic Viewport Height) for better mobile browser support
   return (
-    <div className="flex flex-col h-screen bg-slate-950 text-slate-100 relative overflow-hidden font-sans">
+    <div className="flex flex-col h-[100dvh] bg-slate-950 text-slate-100 relative overflow-hidden font-sans">
       {/* Background Ambience */}
       <div className="absolute top-0 left-0 w-full h-full pointer-events-none -z-10">
          <div className="absolute top-[-20%] right-[-10%] w-[600px] h-[600px] bg-amber-900/10 rounded-full blur-[120px]"></div>
          <div className="absolute bottom-[-10%] left-[-10%] w-[500px] h-[500px] bg-teal-900/10 rounded-full blur-[100px]"></div>
       </div>
 
-      {/* Header */}
-      <header className="flex items-center justify-between p-4 border-b border-slate-800/50 backdrop-blur-sm bg-slate-950/80 z-20">
+      {/* Header - Sticky to ensure visibility */}
+      <header className="sticky top-0 w-full flex items-center justify-between p-4 border-b border-slate-800/50 backdrop-blur-md bg-slate-950/80 z-20 shrink-0">
         <div className="flex items-center gap-3">
             <div className="w-8 h-8 rounded-full bg-gradient-to-br from-teal-600 to-blue-900 flex items-center justify-center shadow-[0_0_10px_rgba(45,212,191,0.4)]">
-                {/* Simple feather icon representation */}
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" className="w-4 h-4 text-amber-300">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8zm-1-13h2v6h-2zm0 8h2v2h-2z" />
-                </svg>
+                <Sparkles className="w-4 h-4 text-amber-300" />
             </div>
             <div>
                 <h2 className="text-lg font-serif text-amber-500 leading-none">Krishna</h2>
-                <span className="text-xs text-slate-500 uppercase tracking-wide">The Digital Charioteer</span>
+                <span className="text-xs text-slate-500 uppercase tracking-wide hidden md:inline">The Digital Charioteer</span>
             </div>
         </div>
         <div className="flex items-center gap-2">
+            {/* Desktop Voice Button */}
+            <button 
+                onClick={startLiveSession}
+                className="flex items-center gap-2 px-3 py-1.5 bg-teal-900/30 text-teal-300 border border-teal-500/30 rounded-full hover:bg-teal-900/50 transition-all shadow-[0_0_10px_rgba(45,212,191,0.2)]"
+                title="Start Voice Conversation"
+            >
+                <Mic size={16} />
+                <span className="text-xs font-semibold uppercase tracking-wider hidden sm:inline">Voice Mode</span>
+            </button>
+            
+            <div className="w-px h-6 bg-slate-800 mx-1"></div>
+            
             <button 
                 onClick={toggleMeditation}
                 className="p-2 text-slate-400 hover:text-teal-400 transition-colors"
@@ -283,41 +387,67 @@ const App: React.FC = () => {
                     if (voiceEnabled) stopAudio();
                 }}
                 className={`p-2 transition-colors ${voiceEnabled ? 'text-teal-400' : 'text-slate-500 hover:text-teal-200'}`}
-                title="Toggle Voice Mode"
+                title="Toggle Text-to-Speech"
             >
                 {voiceEnabled ? <Volume2 size={20} /> : <VolumeX size={20} />}
+            </button>
+            <div className="w-px h-6 bg-slate-800 mx-1"></div>
+            <button 
+                onClick={handleLogout}
+                className="p-2 text-slate-500 hover:text-red-400 transition-colors"
+                title="Logout"
+            >
+                <LogOut size={20} />
             </button>
         </div>
       </header>
 
       {/* Chat Area */}
-      <main className="flex-1 overflow-y-auto p-4 md:p-8 space-y-6">
-        {messages.map((msg) => (
-          <div 
-            key={msg.id} 
-            className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'} animate-fade-in`}
-          >
-            <div className={`max-w-[85%] md:max-w-[70%] p-5 rounded-2xl relative ${
-                msg.role === 'user' 
-                ? 'bg-slate-800 text-slate-200 rounded-tr-none' 
-                : 'bg-teal-950/30 border border-teal-900/30 text-slate-100 rounded-tl-none shadow-[0_4px_20px_rgba(0,0,0,0.2)]'
-            }`}>
-                 {msg.role === 'model' && (
-                    <div className="absolute -top-3 -left-2 text-amber-500/50">
-                        <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2L15.09 8.26L22 9.27L17 14.14L18.18 21.02L12 17.77L5.82 21.02L7 14.14L2 9.27L8.91 8.26L12 2Z" /></svg>
-                    </div>
-                 )}
-                 <div className="font-light text-base md:text-lg">
-                    {renderText(msg.text)}
-                 </div>
-                 <div className="mt-2 text-right">
-                    <span className="text-[10px] text-slate-500 uppercase tracking-widest">
-                        {new Date(msg.timestamp).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}
-                    </span>
-                 </div>
-            </div>
+      <main className="flex-1 overflow-y-auto p-4 md:p-8 space-y-6 scroll-smooth">
+        {messages.length === 0 ? (
+          <div className="h-full flex flex-col items-center justify-center animate-fade-in">
+             <FeatherVisualizer state="idle" />
+             <p className="mt-8 text-slate-500 text-sm font-light italic mb-8">"I am never lost to one who sees Me everywhere."</p>
+             
+             {/* Call to Action for Voice */}
+             <button 
+                onClick={startLiveSession}
+                className="flex items-center gap-3 px-6 py-3 bg-gradient-to-r from-teal-900 to-slate-900 border border-teal-500/30 rounded-full hover:shadow-[0_0_20px_rgba(45,212,191,0.3)] transition-all group"
+             >
+                <div className="p-2 bg-teal-500/20 rounded-full group-hover:bg-teal-500/30 transition-colors">
+                    <Mic className="text-teal-300 w-5 h-5" />
+                </div>
+                <span className="text-teal-100 uppercase tracking-widest text-xs font-semibold">Speak with Krishna</span>
+             </button>
           </div>
-        ))}
+        ) : (
+          messages.map((msg) => (
+            <div 
+              key={msg.id} 
+              className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'} animate-fade-in`}
+            >
+              <div className={`max-w-[85%] md:max-w-[70%] p-5 rounded-2xl relative ${
+                  msg.role === 'user' 
+                  ? 'bg-slate-800 text-slate-200 rounded-tr-none' 
+                  : 'bg-teal-950/30 border border-teal-900/30 text-slate-100 rounded-tl-none shadow-[0_4px_20px_rgba(0,0,0,0.2)]'
+              }`}>
+                   {msg.role === 'model' && (
+                      <div className="absolute -top-3 -left-2 text-amber-500/50">
+                          <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2L15.09 8.26L22 9.27L17 14.14L18.18 21.02L12 17.77L5.82 21.02L7 14.14L2 9.27L8.91 8.26L12 2Z" /></svg>
+                      </div>
+                   )}
+                   <div className="font-light text-base md:text-lg">
+                      {renderText(msg.text)}
+                   </div>
+                   <div className="mt-2 text-right">
+                      <span className="text-[10px] text-slate-500 uppercase tracking-widest">
+                          {new Date(msg.timestamp).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}
+                      </span>
+                   </div>
+              </div>
+            </div>
+          ))
+        )}
         
         {isLoading && (
             <div className="flex justify-start w-full py-4">
@@ -339,8 +469,17 @@ const App: React.FC = () => {
         <div ref={messagesEndRef} />
       </main>
 
+      {/* Floating Action Button for Voice - Mobile Friendly */}
+      <button
+        onClick={startLiveSession}
+        className="fixed bottom-24 right-6 w-14 h-14 bg-teal-600 rounded-full flex items-center justify-center shadow-[0_0_20px_rgba(45,212,191,0.4)] z-30 hover:bg-teal-500 transition-all active:scale-95 md:hidden"
+        title="Speak to Krishna"
+      >
+        <Mic className="text-white w-6 h-6" />
+      </button>
+
       {/* Input Area */}
-      <footer className="p-4 bg-slate-950 border-t border-slate-800/50 z-20">
+      <footer className="p-4 bg-slate-950 border-t border-slate-800/50 z-20 shrink-0">
         <div className="max-w-4xl mx-auto relative">
             <input 
                 type="text"
