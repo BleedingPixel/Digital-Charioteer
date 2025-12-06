@@ -1,7 +1,8 @@
 import { GoogleGenAI, Modality } from "@google/genai";
 import { Message } from '../types';
 
-const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+// Removed global 'ai' instance to prevent stale API keys.
+// The client is now instantiated inside each function to ensure it uses the latest process.env.API_KEY.
 
 // System instructions for the persona
 export const getSystemInstruction = (userName: string, sanskritEnabled: boolean) => `
@@ -41,6 +42,7 @@ export const generateKrishnaResponse = async (
   sanskritEnabled: boolean
 ): Promise<string> => {
   try {
+    const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
     const model = 'gemini-2.5-flash';
     
     // Convert app history to API history format
@@ -68,6 +70,7 @@ export const generateKrishnaResponse = async (
 
 export const generateSpeech = async (text: string): Promise<AudioBuffer | null> => {
   try {
+    const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
     const response = await ai.models.generateContent({
       model: "gemini-2.5-flash-preview-tts",
       contents: [{ parts: [{ text: text }] }],
@@ -116,6 +119,7 @@ export const getDailyShloka = async (): Promise<string> => {
     ];
 
     try {
+        const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
         // Force variety by picking a random chapter for the context
         const chapters = [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18];
         const randomChapter = chapters[Math.floor(Math.random() * chapters.length)];

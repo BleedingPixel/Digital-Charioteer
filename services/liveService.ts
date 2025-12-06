@@ -1,9 +1,8 @@
 import { GoogleGenAI, LiveServerMessage, Modality } from "@google/genai";
 import { getSystemInstruction } from './geminiService';
 
-const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+// --- Audio Helper Functions ---
 
-// Audio Helper Functions
 function base64ToBytes(base64: string): Uint8Array {
   const binaryString = atob(base64);
   const len = binaryString.length;
@@ -23,16 +22,51 @@ function bytesToBase64(bytes: Uint8Array): string {
   return btoa(binary);
 }
 
-function createBlob(data: Float32Array): { data: string; mimeType: string } {
-  const l = data.length;
-  const int16 = new Int16Array(l);
-  for (let i = 0; i < l; i++) {
-    int16[i] = data[i] * 32768;
-  }
-  return {
-    data: bytesToBase64(new Uint8Array(int16.buffer)),
-    mimeType: 'audio/pcm;rate=16000',
-  };
+/**
+ * Resamples input audio from any sample rate to 16kHz and converts to Int16 PCM.
+ * @param input Float32Array of audio data from the browser
+ * @param inputSampleRate The native sample rate of the microphone (e.g., 44100, 48000)
+ * @returns Int16Array at 16000Hz
+ */
+function downsampleTo16k(input: Float32Array, inputSampleRate: number): Int16Array {
+    const targetSampleRate = 16000;
+    
+    if (inputSampleRate === targetSampleRate) {
+        // No resampling needed, just convert float to int16
+        const output = new Int16Array(input.length);
+        for (let i = 0; i < input.length; i++) {
+             let s = Math.max(-1, Math.min(1, input[i]));
+             output[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+        }
+        return output;
+    }
+
+    const ratio = inputSampleRate / targetSampleRate;
+    const newLength = Math.round(input.length / ratio);
+    const output = new Int16Array(newLength);
+
+    for (let i = 0; i < newLength; i++) {
+        const offset = i * ratio;
+        const index = Math.floor(offset);
+        const decimal = offset - index;
+        
+        // Linear interpolation for smoother audio
+        const v1 = input[index] || 0;
+        const v2 = input[index + 1] || v1; // Fallback to v1 if at end
+        let val = (v1 * (1 - decimal) + v2 * decimal);
+        
+        // Clamp and Scale to Int16
+        val = Math.max(-1, Math.min(1, val));
+        output[i] = val < 0 ? val * 0x8000 : val * 0x7FFF;
+    }
+    return output;
+}
+
+function createAudioData(int16Data: Int16Array): { data: string; mimeType: string } {
+    return {
+        data: bytesToBase64(new Uint8Array(int16Data.buffer)),
+        mimeType: 'audio/pcm;rate=16000',
+    };
 }
 
 export class LiveSession {
@@ -45,12 +79,25 @@ export class LiveSession {
   private sessionPromise: Promise<any> | null = null;
   private activeSources: Set<AudioBufferSourceNode> = new Set();
   private isConnected = false;
+  
+  // VAD State
+  private isModelSpeaking = false;
+  private silenceTimer: any = null;
 
-  public onVisualizerUpdate: (state: 'listening' | 'speaking' | 'idle') => void;
+  public onVisualizerUpdate: (state: 'user_active' | 'model_speaking' | 'idle') => void;
+  public onError: (error: string) => void;
 
-  constructor(onVisualizerUpdate: (state: 'listening' | 'speaking' | 'idle') => void) {
+  constructor(
+      onVisualizerUpdate: (state: 'user_active' | 'model_speaking' | 'idle') => void,
+      onError: (error: string) => void
+  ) {
     this.onVisualizerUpdate = onVisualizerUpdate;
-    this.inputAudioContext = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
+    this.onError = onError;
+    
+    // Use browser default sample rate for input to avoid hardware issues
+    this.inputAudioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
+    
+    // Output at 24kHz (common for Gemini TTS models)
     this.outputAudioContext = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
     this.outputNode = this.outputAudioContext.createGain();
     this.outputNode.connect(this.outputAudioContext.destination);
@@ -59,10 +106,27 @@ export class LiveSession {
   async connect(userName: string, sanskritEnabled: boolean) {
     if (this.isConnected) return;
     
+    if (!process.env.API_KEY) {
+        this.onError("API Key is missing. Please ensure billing is enabled.");
+        return;
+    }
+
     try {
-        console.log("Starting Live Session...");
-        // Request Mic Permission
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        console.log(`Starting Live Session. Input Rate: ${this.inputAudioContext.sampleRate}Hz`);
+        
+        // Ensure AudioContexts are running (important for some browsers)
+        await this.resumeContexts();
+
+        const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+        
+        // Request Mic Permission - Let browser decide settings
+        const stream = await navigator.mediaDevices.getUserMedia({ 
+            audio: {
+                echoCancellation: true,
+                autoGainControl: true,
+                noiseSuppression: true
+            } 
+        });
         
         // Initialize Session
         this.sessionPromise = ai.live.connect({
@@ -71,14 +135,16 @@ export class LiveSession {
             onopen: () => {
               console.log("Live Session Connected");
               this.isConnected = true;
-              this.onVisualizerUpdate('listening');
+              this.onVisualizerUpdate('idle');
               this.setupAudioInput(stream);
             },
             onmessage: async (message: LiveServerMessage) => {
               // Handle interruptions
               const interrupted = message.serverContent?.interrupted;
               if (interrupted) {
+                console.log("Interrupted by user");
                 this.stopAudioPlayback();
+                this.isModelSpeaking = false;
                 this.nextStartTime = 0;
                 return;
               }
@@ -86,17 +152,17 @@ export class LiveSession {
               // Handle Audio Output
               const base64Audio = message.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
               if (base64Audio) {
-                this.onVisualizerUpdate('speaking');
+                if (!this.isModelSpeaking) {
+                     this.isModelSpeaking = true;
+                     this.onVisualizerUpdate('model_speaking');
+                }
                 this.queueAudioOutput(base64Audio);
               }
               
-              // Detect turn completion (Model finished generation)
-              if (message.serverContent?.turnComplete) {
-                 setTimeout(() => {
-                     if (this.activeSources.size === 0) {
-                         this.onVisualizerUpdate('listening');
-                     }
-                 }, 500);
+              const turnComplete = message.serverContent?.turnComplete;
+              if (turnComplete) {
+                  // The model is done generating for this turn
+                  // We rely on the audio queue to finish playing to set state back to idle
               }
             },
             onclose: () => {
@@ -106,7 +172,10 @@ export class LiveSession {
             },
             onerror: (err) => {
               console.error("Live API Error:", err);
+              this.isConnected = false;
               this.onVisualizerUpdate('idle');
+              const msg = err instanceof Error ? err.message : String(err);
+              this.onError(`Live Connection Error: ${msg}`);
             }
           },
           config: {
@@ -120,26 +189,67 @@ export class LiveSession {
     } catch (error) {
         console.error("Failed to connect live session:", error);
         this.onVisualizerUpdate('idle');
+        this.onError("Failed to access microphone or connect. Please check permissions.");
     }
   }
 
+  private async resumeContexts() {
+      if (this.inputAudioContext.state === 'suspended') await this.inputAudioContext.resume();
+      if (this.outputAudioContext.state === 'suspended') await this.outputAudioContext.resume();
+  }
+
   private setupAudioInput(stream: MediaStream) {
-    if (this.inputAudioContext.state === 'suspended') {
-      this.inputAudioContext.resume();
-    }
-    
     this.inputSource = this.inputAudioContext.createMediaStreamSource(stream);
-    this.scriptProcessor = this.inputAudioContext.createScriptProcessor(4096, 1, 1);
+    
+    // ScriptProcessorNode (deprecated but effective for raw access)
+    // 2048 buffer size = ~46ms latency at 44.1k, ~42ms at 48k. Good balance.
+    this.scriptProcessor = this.inputAudioContext.createScriptProcessor(2048, 1, 1);
     
     this.scriptProcessor.onaudioprocess = (e) => {
       if (!this.isConnected) return;
       
       const inputData = e.inputBuffer.getChannelData(0);
-      const pcmBlob = createBlob(inputData);
-      
+
+      // --- Voice Activity Detection (VAD) ---
+      if (!this.isModelSpeaking) {
+          let sum = 0;
+          for (let i = 0; i < inputData.length; i++) {
+            sum += inputData[i] * inputData[i];
+          }
+          const rms = Math.sqrt(sum / inputData.length);
+          const threshold = 0.005; // Lower threshold to catch soft speech
+
+          // Debug log (uncomment if needed)
+          // console.log(`RMS: ${rms.toFixed(4)}`);
+
+          if (rms > threshold) {
+              if (this.silenceTimer) {
+                  clearTimeout(this.silenceTimer);
+                  this.silenceTimer = null;
+              }
+              this.onVisualizerUpdate('user_active');
+          } else {
+              if (!this.silenceTimer) {
+                  this.silenceTimer = setTimeout(() => {
+                      this.onVisualizerUpdate('idle');
+                      this.silenceTimer = null;
+                  }, 500); // 500ms silence before returning to idle
+              }
+          }
+      }
+
+      // --- Resample & Send Data ---
+      // We must resample to 16kHz for the API
+      const pcm16k = downsampleTo16k(inputData, this.inputAudioContext.sampleRate);
+      const blobData = createAudioData(pcm16k);
+
       if (this.sessionPromise) {
         this.sessionPromise.then((session) => {
-            session.sendRealtimeInput({ media: pcmBlob });
+            try {
+                session.sendRealtimeInput({ media: blobData });
+            } catch (e) {
+                console.error("Error sending input:", e);
+            }
         });
       }
     };
@@ -170,12 +280,22 @@ export class LiveSession {
     source.onended = () => {
         this.activeSources.delete(source);
         if (this.activeSources.size === 0) {
-            this.onVisualizerUpdate('listening');
+            this.isModelSpeaking = false;
+            // Short delay to see if more audio packets arrive
+            setTimeout(() => {
+                if (!this.isModelSpeaking && this.isConnected) {
+                    this.onVisualizerUpdate('idle');
+                }
+            }, 300);
         }
     };
 
-    // Schedule playback
-    this.nextStartTime = Math.max(this.nextStartTime, this.outputAudioContext.currentTime);
+    const currentTime = this.outputAudioContext.currentTime;
+    // Ensure we schedule in the future
+    if (this.nextStartTime < currentTime) {
+        this.nextStartTime = currentTime;
+    }
+    
     source.start(this.nextStartTime);
     this.nextStartTime += buffer.duration;
     
@@ -183,31 +303,41 @@ export class LiveSession {
   }
 
   private stopAudioPlayback() {
-    this.activeSources.forEach(source => source.stop());
+    this.activeSources.forEach(source => {
+        try { source.stop(); } catch(e) {}
+    });
     this.activeSources.clear();
   }
 
   async disconnect() {
     this.isConnected = false;
     this.stopAudioPlayback();
+    this.isModelSpeaking = false;
     
-    if (this.scriptProcessor && this.inputSource) {
-        this.inputSource.disconnect();
-        this.scriptProcessor.disconnect();
-    }
-    
-    // Close Media Stream Tracks
+    // Clean up nodes
     if (this.inputSource) {
-        (this.inputSource.mediaStream as MediaStream).getTracks().forEach(track => track.stop());
+        try {
+            this.inputSource.disconnect();
+            (this.inputSource.mediaStream as MediaStream).getTracks().forEach(track => track.stop());
+        } catch (e) { console.error("Error closing input source:", e); }
+        this.inputSource = null;
     }
 
-    // Ideally: (await this.sessionPromise).close();
-    if (this.sessionPromise) {
-        this.sessionPromise.then(session => {
-            // session.close() if available in type definition, otherwise just drop
-        });
+    if (this.scriptProcessor) {
+        try { this.scriptProcessor.disconnect(); } catch (e) {}
+        this.scriptProcessor = null;
+    }
+
+    // Close contexts to release hardware
+    if (this.inputAudioContext && this.inputAudioContext.state !== 'closed') {
+        try { await this.inputAudioContext.close(); } catch(e) {}
     }
     
+    if (this.outputAudioContext && this.outputAudioContext.state !== 'closed') {
+         try { await this.outputAudioContext.close(); } catch(e) {}
+    }
+
+    this.sessionPromise = null;
     this.onVisualizerUpdate('idle');
   }
 }

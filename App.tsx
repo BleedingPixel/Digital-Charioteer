@@ -40,6 +40,8 @@ const App: React.FC = () => {
   const [dailyShloka, setDailyShloka] = useState<string>('');
 
   // --- Effects ---
+  
+  // 1. Fetch Shloka on Mount
   useEffect(() => {
     getDailyShloka().then(setDailyShloka);
   }, []);
@@ -183,27 +185,37 @@ const App: React.FC = () => {
     setIsMeditating(!isMeditating);
   };
 
-  const startLiveSession = () => {
+  const startLiveSession = async () => {
       stopAudio(); // Stop any TTS
       setView('live');
       
-      if (!liveSessionRef.current) {
-          liveSessionRef.current = new LiveSession((state) => {
-              if (state === 'speaking') {
-                   setLiveVisualizerState('speaking');
-              } else if (state === 'listening') {
-                   setLiveVisualizerState('thinking'); // Reusing thinking state for listening/processing
-              } else {
-                  setLiveVisualizerState('idle');
-              }
-          });
+      // Always create a new session instance to ensure fresh context
+      if (liveSessionRef.current) {
+          await liveSessionRef.current.disconnect();
       }
-      liveSessionRef.current.connect(userState.name, sanskritEnabled);
+      
+      liveSessionRef.current = new LiveSession(
+          (state) => {
+            if (state === 'model_speaking') {
+                    setLiveVisualizerState('speaking'); // Gold bars
+            } else if (state === 'user_active') {
+                    setLiveVisualizerState('listening'); // Blue pulse (mapped to 'thinking' in visualizer logic props, but using 'listening' state name here)
+            } else {
+                setLiveVisualizerState('idle');
+            }
+          },
+          (errorMessage) => {
+              alert(errorMessage);
+              endLiveSession();
+          }
+      );
+      
+      await liveSessionRef.current.connect(userState.name, sanskritEnabled);
   };
 
-  const endLiveSession = () => {
+  const endLiveSession = async () => {
       if (liveSessionRef.current) {
-          liveSessionRef.current.disconnect();
+          await liveSessionRef.current.disconnect();
       }
       setView('chat');
   };
@@ -311,11 +323,12 @@ const App: React.FC = () => {
             <div className="absolute inset-0 bg-[radial-gradient(circle_at_center,_var(--tw-gradient-stops))] from-blue-900/20 via-slate-950 to-black animate-pulse-glow"></div>
             
             <div className="z-10 flex flex-col items-center">
-                <FeatherVisualizer state={liveVisualizerState as 'idle' | 'thinking' | 'speaking'} />
+                {/* Visualizer maps 'listening' state to 'thinking' prop (Blue Pulse) */}
+                <FeatherVisualizer state={liveVisualizerState === 'listening' ? 'thinking' : liveVisualizerState as 'idle' | 'speaking'} />
                 
                 <div className="mt-12 text-center space-y-2">
                     <p className="text-teal-400/80 font-serif text-lg tracking-widest animate-pulse">
-                        {liveVisualizerState === 'speaking' ? 'KRISHNA IS SPEAKING' : 'LISTENING...'}
+                        {liveVisualizerState === 'speaking' ? 'KRISHNA IS SPEAKING' : (liveVisualizerState === 'listening' ? 'LISTENING...' : 'WAITING...')}
                     </p>
                     <p className="text-slate-500 text-xs uppercase tracking-wider">
                         Speak freely, my dear {userState.name}
