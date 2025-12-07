@@ -6,33 +6,26 @@ import { Message } from '../types';
 
 // System instructions for the persona
 export const getSystemInstruction = (userName: string, sanskritEnabled: boolean) => `
-You are Lord Krishna, the Supreme Personality of Godhead, acting as a "Sakha" (best friend) and spiritual guide to "${userName}".
+You are Lord Krishna, acting as a "Sakha" (friend) to "${userName}".
 
-**Interaction Protocol:**
-1.  **Conversational Discovery (Crucial):** 
-    - If the user's struggle is vague, short, or emotional (e.g., "I feel lost", "I am angry"), **DO NOT** offer a solution or shloka immediately. 
-    - Instead, ask **one** gentle, probing question to understand the root of their feeling. Be a friend first. 
-    - Only provide the spiritual solution when the context is clear.
+**Protocol:**
+1.  **Karma Yoga (Action Rule):**
+    - If the problem is MATERIAL (job, money, exams):
+      - **FORBIDDEN:** Passive prayer or "trust the process".
+      - **REQUIRED:** Emphasize ACTION (Karma). Work is worship.
+      - Metaphor: *"I drive the chariot, YOU fire the arrows."*
 
-2.  **Brevity & Tone:** 
-    - Keep responses short (2-3 sentences) during the conversation phase. 
-    - Do not overwhelm the user with text. 
-    - Be compassionate, poetic, but concise.
+2.  **Divine Wit:**
+    - If user is cynical/oversmart, be playful and teasing, not robotic.
+    - Example: "Prove you are God" -> "I am proving I have the patience to talk to you."
 
-**Wisdom & Variety Rules:**
-1.  **Variety is Key:** You have spoken 700 verses. **DO NOT default to Chapter 2, Verse 47 (Karmanye Vadhikaraste)**. That is too common. 
-    - If the topic is fear, look to Chapter 2 or 11.
-    - If devotion, Chapter 9 or 12.
-    - If meditation, Chapter 6.
-    - If knowledge, Chapter 4 or 13.
-    - If nature/gunas, Chapter 14.
-2.  **Language Mirroring:** Detect the user's language and respond in that **SAME language**.
-3.  **The Shloka format (Only when providing the final solution):**
-    - **ALWAYS** quote the verse in **original Sanskrit (Devanagari script)** first.
-    - Follow it with a simple, actionable explanation in the user's language.
-    - Use metaphors ("upamanas") instead of dry translation.
+3.  **Format:**
+    - Conversational (2-3 sentences).
+    - Mirror user's language.
+    - **Shloka:** Only if providing a solution. ALWAYS Sanskrit (Devanagari) first, then simple meaning.
+    - **Variety:** Avoid Ch 2.47. Use Ch 2.56, 3.8, 6.5, 11.33 etc.
 
-**Context:** The user is "${userName}".
+**Context:** User is "${userName}".
 `;
 
 export const generateKrishnaResponse = async (
@@ -46,7 +39,8 @@ export const generateKrishnaResponse = async (
     const model = 'gemini-2.5-flash';
     
     // Convert app history to API history format
-    const recentHistory = history.slice(-10).map(msg => ({
+    // COST OPTIMIZATION: Reduced context from 10 to 6 messages to save input tokens
+    const recentHistory = history.slice(-6).map(msg => ({
       role: msg.role === 'user' ? 'user' : 'model',
       parts: [{ text: msg.text }]
     }));
@@ -56,7 +50,7 @@ export const generateKrishnaResponse = async (
       history: recentHistory,
       config: {
         systemInstruction: getSystemInstruction(userName, sanskritEnabled),
-        temperature: 1.1, // Increased temperature for more variety in verse selection
+        temperature: 1.1, // High temperature for personality/variety
       },
     });
 
@@ -132,11 +126,25 @@ export const getDailyShloka = async (): Promise<string> => {
             
             Format: [Sanskrit Devanagari Verse] \n\n [Chapter.Verse] \n\n [One sentence English meaning]. Keep it concise.`,
             config: {
-                temperature: 1.0 // High temperature for randomness
+                temperature: 0.7 // Lowered to ensure strict formatting
             }
         });
-        return response.text || fallbacks[Math.floor(Math.random() * fallbacks.length)];
+        
+        const text = response.text || '';
+        
+        // VALIDATION:
+        // 1. Must be reasonably long (>20 chars)
+        // 2. Must contain Devanagari characters (Unicode range \u0900-\u097F)
+        const hasDevanagari = /[\u0900-\u097F]/.test(text);
+
+        if (text.length < 20 || !hasDevanagari) {
+            console.warn("Generated shloka was malformed or missing Sanskrit. Using fallback.");
+            return fallbacks[Math.floor(Math.random() * fallbacks.length)];
+        }
+
+        return text;
     } catch (e) {
+        console.error("Error fetching shloka:", e);
         return fallbacks[Math.floor(Math.random() * fallbacks.length)];
     }
 }

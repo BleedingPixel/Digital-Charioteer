@@ -46,12 +46,18 @@ const App: React.FC = () => {
   // 1. API Key Check on Mount
   useEffect(() => {
     const checkKey = async () => {
-        if ((window as any).aistudio) {
-            const hasKey = await (window as any).aistudio.hasSelectedApiKey();
-            setHasApiKey(hasKey);
-        } else {
-            // Not in AI Studio environment, assume env var is sufficient
-            setHasApiKey(true);
+        try {
+            if ((window as any).aistudio) {
+                const hasKey = await (window as any).aistudio.hasSelectedApiKey();
+                setHasApiKey(hasKey);
+            } else {
+                // Not in AI Studio environment, assume env var is sufficient
+                setHasApiKey(true);
+            }
+        } catch (e) {
+            console.error("Error checking API key:", e);
+            // Default to false to be safe, forcing user to try connecting
+            setHasApiKey(false);
         }
     };
     checkKey();
@@ -88,9 +94,14 @@ const App: React.FC = () => {
   
   const handleSelectKey = async () => {
     if ((window as any).aistudio) {
-        await (window as any).aistudio.openSelectKey();
-        // Assume success after dialog interaction to avoid race conditions
-        setHasApiKey(true); 
+        try {
+            await (window as any).aistudio.openSelectKey();
+        } catch (e) {
+            console.error("API Key selection failed or cancelled", e);
+        }
+        // We assume success or user intent to proceed. 
+        // Force state update to unblock UI.
+        setHasApiKey(true);
     }
   };
 
@@ -254,10 +265,10 @@ const App: React.FC = () => {
         <div className="min-h-screen bg-slate-950 flex flex-col items-center justify-center p-6 text-slate-100 relative overflow-hidden font-sans">
              <div className="absolute top-0 left-0 w-full h-full bg-[radial-gradient(ellipse_at_top,_var(--tw-gradient-stops))] from-slate-900 via-[#020617] to-black -z-10"></div>
              <FeatherVisualizer state="idle" />
-             <div className="mt-8 text-center max-w-md bg-slate-900/50 backdrop-blur border border-slate-800 p-8 rounded-2xl shadow-2xl">
+             <div className="mt-8 text-center max-w-md bg-slate-900/50 backdrop-blur border border-slate-800 p-8 rounded-2xl shadow-2xl animate-fade-in">
                 <h1 className="text-2xl font-serif text-amber-500 mb-4">Divine Connection Required</h1>
                 <p className="text-slate-400 text-sm mb-6">
-                    To commune with the Digital Charioteer, you must first connect a valid Google Cloud API Key with billing enabled.
+                    To commune with the Digital Charioteer, you must connect a valid Google Cloud API Key (with billing enabled).
                 </p>
                 <button 
                     onClick={handleSelectKey}
